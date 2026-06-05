@@ -1,0 +1,13 @@
+services:
+  blink-snap:
+    image: cjedro/blink-snap:latest
+    pull_policy: always
+    environment:
+      BLINK_USERNAME: ${BLINK_USERNAME}
+      BLINK_PASSWORD: ${BLINK_PASSWORD}
+      CAMERA: ${CAMERA}
+      INTERVAL: ${INTERVAL}
+    volumes:
+      - ./blink_session.json:/data/blink_session.json
+      - ./captures:/data/captures
+    restart: unless-stopped

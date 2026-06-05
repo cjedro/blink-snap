@@ -1,0 +1,21 @@
+# Future local captures
+captures/
+*.jpg
+*.jpeg
+*.mp4
+
+# Credentials and session cache (never commit)
+.env
+.env.*
+!/.env.example
+!/.env.docker.example
+.env.docker
+blink_session.json
+blink_credentials.json
+*credentials*.json
+
+# Python (future implementation)
+.venv/
+venv/
+__pycache__/
+*.pyc
