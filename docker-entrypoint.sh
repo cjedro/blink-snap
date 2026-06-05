@@ -14,6 +14,15 @@ if [ -n "$missing" ]; then
     exit 1
 fi
 
+python serve.py &
+serve_pid=$!
+
+cleanup() {
+    kill "$serve_pid" 2>/dev/null || true
+}
+
+trap cleanup INT TERM EXIT
+
 exec python snap.py \
     --camera "$CAMERA" \
     --interval "$INTERVAL" \
