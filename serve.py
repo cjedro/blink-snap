@@ -28,6 +28,13 @@ def newest_image(directory: Path) -> Path | None:
     return max(images, key=lambda path: path.stat().st_mtime)
 
 
+def last_successful_update_timestamp(directory: Path) -> float | None:
+    image = newest_image(directory)
+    if image is None:
+        return None
+    return image.stat().st_mtime
+
+
 class CaptureHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -36,6 +43,8 @@ class CaptureHandler(BaseHTTPRequestHandler):
             self._serve_page()
         elif path == "/latest.jpg":
             self._serve_image()
+        elif path == "/metrics":
+            self._serve_metrics()
         else:
             self.send_error(404)
 
@@ -86,6 +95,22 @@ class CaptureHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_metrics(self) -> None:
+        timestamp = last_successful_update_timestamp(CAPTURES_DIR)
+        value = f"{timestamp:.6f}" if timestamp is not None else "0"
+        body = (
+            "# HELP blink_snap_last_successful_update_timestamp_seconds "
+            "Unix timestamp of the last successful capture update.\n"
+            "# TYPE blink_snap_last_successful_update_timestamp_seconds gauge\n"
+            f"blink_snap_last_successful_update_timestamp_seconds {value}\n"
+        ).encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:
         return
