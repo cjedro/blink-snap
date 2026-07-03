@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import secrets
+import threading
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +20,13 @@ from export import (
     default_fps_from_interval,
     filter_images,
     ffmpeg_available,
+)
+from export_jobs import (
+    create_job,
+    ensure_exports_dir,
+    list_jobs,
+    load_job,
+    update_job,
 )
 
 CAPTURES_DIR = Path(os.getenv("CAPTURES_DIR", "/data/captures"))
@@ -50,6 +59,15 @@ EXPORT_CSS = (
     ".actions{display:flex;gap:0.75rem;align-items:center;margin-top:1rem}"
     "a{color:#8cf}"
     ".disabled{color:#666}"
+    ".success{background:#1f3a1f;border:1px solid #373;color:#bfb;"
+    "padding:0.75rem;border-radius:4px;margin-bottom:1rem;font-size:0.875rem}"
+    ".exports{width:100%;border-collapse:collapse;font-size:0.8125rem;margin-top:0.5rem}"
+    ".exports th,.exports td{border-bottom:1px solid #333;padding:0.5rem;text-align:left;"
+    "vertical-align:top}"
+    ".exports th{color:#999;font-weight:500}"
+    ".status-running{color:#9cf}"
+    ".status-error{color:#fbb}"
+    "main.wide{max-width:40rem}"
 )
 
 EXPORT_JS = """
@@ -67,11 +85,51 @@ function toggleCustomFps() {
   const on = document.getElementById('custom_fps').checked;
   document.getElementById('fps').disabled = !on;
 }
+function disableExportSubmit(form) {
+  const btn = form.querySelector('button[type="submit"]');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Queuing…';
+  }
+  return true;
+}
 document.addEventListener('DOMContentLoaded', function() {
   toggleScope();
   toggleSkipHours();
   toggleCustomFps();
+  pollExports();
 });
+function pollExports() {
+  var table = document.getElementById('exports-table');
+  if (!table) return;
+  var active = table.querySelectorAll('[data-status="queued"],[data-status="running"]');
+  if (active.length === 0) return;
+  fetch('/export/status')
+    .then(function(response) { return response.json(); })
+    .then(function(jobs) {
+      jobs.forEach(function(job) {
+        var row = document.getElementById('export-' + job.export_id);
+        if (!row) return;
+        row.dataset.status = job.status;
+        var statusCell = row.querySelector('.export-status');
+        if (!statusCell) return;
+        if (job.status === 'done') {
+          statusCell.innerHTML = '<a href="/export/download/' + encodeURIComponent(job.export_id) + '">Download</a>';
+        } else if (job.status === 'error') {
+          statusCell.textContent = job.error || 'Failed';
+          statusCell.className = 'export-status status-error';
+        } else {
+          statusCell.className = 'export-status status-running';
+          statusCell.textContent = Math.round(job.percent) + '% — ' + job.message;
+        }
+      });
+      var stillActive = table.querySelectorAll('[data-status="queued"],[data-status="running"]');
+      if (stillActive.length > 0) {
+        setTimeout(pollExports, 1500);
+      }
+    })
+    .catch(function() { setTimeout(pollExports, 3000); });
+}
 """
 
 
@@ -125,9 +183,106 @@ def _default_fps_hint() -> str:
     )
 
 
+def _export_label(options: ExportOptions, image_count: int) -> str:
+    if options.scope == "whole":
+        desc = "Whole timelapse"
+    else:
+        desc = f"{options.from_date} — {options.to_date}"
+    return f"{desc} ({image_count} pictures)"
+
+
+def _format_created_at(created_at: str) -> str:
+    try:
+        return datetime.fromisoformat(created_at).strftime("%d/%m/%Y %H:%M:%S")
+    except ValueError:
+        return created_at
+
+
+def _export_status_cell(job) -> str:
+    if job.status == "done":
+        return (
+            f'<a href="/export/download/{html.escape(job.export_id)}">Download</a>'
+        )
+    if job.status == "error":
+        return f'<span class="status-error">{html.escape(job.error or "Failed")}</span>'
+    return (
+        f'<span class="status-running">{round(job.percent)}% — '
+        f"{html.escape(job.message)}</span>"
+    )
+
+
+def exports_list_html() -> str:
+    jobs = list_jobs()
+    if not jobs:
+        return '<p class="hint">No exports yet.</p>'
+
+    rows = []
+    for job in jobs:
+        rows.append(
+            f'<tr id="export-{html.escape(job.export_id)}" '
+            f'data-status="{html.escape(job.status)}">'
+            f"<td>{html.escape(_format_created_at(job.created_at))}</td>"
+            f"<td>{html.escape(job.label)}</td>"
+            f'<td class="export-status">{_export_status_cell(job)}</td>'
+            "</tr>"
+        )
+
+    return (
+        '<table class="exports" id="exports-table">'
+        "<thead><tr><th>Created</th><th>Export</th><th>Status</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _run_export_job(
+    export_id: str,
+    images: list[Path],
+    options: ExportOptions,
+    export_timezone: str,
+) -> None:
+    job = load_job(export_id)
+    if job is None:
+        return
+
+    def on_progress(percent: float, message: str) -> None:
+        update_job(
+            export_id,
+            status="running",
+            percent=percent,
+            message=message,
+        )
+
+    update_job(export_id, status="running", message="Starting export…", percent=0)
+    try:
+        build_timelapse_mp4(
+            images,
+            job.mp4_path,
+            options.fps,
+            export_timezone,
+            options.burn_in_timestamp,
+            progress=on_progress,
+        )
+        update_job(
+            export_id,
+            status="done",
+            percent=100,
+            message="Export complete",
+        )
+    except Exception as exc:
+        if job.mp4_path.exists():
+            job.mp4_path.unlink(missing_ok=True)
+        update_job(
+            export_id,
+            status="error",
+            error=str(exc),
+            message="Export failed",
+        )
+
+
 def export_form_html(
     error: str | None = None,
     values: dict[str, str] | None = None,
+    queued: bool = False,
 ) -> str:
     values = values or {}
     interval = capture_interval_seconds()
@@ -144,7 +299,13 @@ def export_form_html(
     fps_value = values.get("fps", f"{default_fps:g}")
 
     error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    queued_html = (
+        '<div class="success">Export queued. It will appear in the list below when ready.</div>'
+        if queued
+        else ""
+    )
     hint = html.escape(_default_fps_hint())
+    exports_html = exports_list_html()
 
     return (
         "<!DOCTYPE html>"
@@ -152,11 +313,12 @@ def export_form_html(
         "<title>Export Timelapse</title>"
         f"<style>{EXPORT_CSS}</style>"
         f"<script>{EXPORT_JS}</script>"
-        "</head><body><main>"
+        '</head><body><main class="wide">'
         "<h1>Export Timelapse</h1>"
+        f"{queued_html}"
         f"{error_html}"
         f'<p class="hint">{hint}</p>'
-        '<form method="post" action="/export">'
+        '<form method="post" action="/export" onsubmit="return disableExportSubmit(this)">'
         "<label>Password"
         '<input type="password" name="password" required autocomplete="current-password">'
         "</label>"
@@ -201,10 +363,13 @@ def export_form_html(
         "</label>"
         "</fieldset>"
         '<div class="actions">'
-        '<button type="submit">Export Timelapse</button>'
+        '<button type="submit">Queue Export</button>'
         '<a href="/">Back</a>'
         "</div>"
-        "</form></main></body></html>"
+        "</form>"
+        "<h2 style=\"font-size:1rem;margin:1.5rem 0 0.5rem\">Available exports</h2>"
+        f"{exports_html}"
+        "</main></body></html>"
     )
 
 
@@ -233,7 +398,13 @@ class CaptureHandler(BaseHTTPRequestHandler):
         elif path == "/metrics":
             self._serve_metrics()
         elif path == "/export":
-            self._serve_export_form()
+            query = parse_qs(urlparse(self.path).query)
+            queued = _field(query, "queued") == "1"
+            self._serve_export_form(queued=queued)
+        elif path == "/export/status":
+            self._serve_exports_status()
+        elif path.startswith("/export/download/"):
+            self._serve_export_download(path.removeprefix("/export/download/"))
         else:
             self.send_error(404)
 
@@ -290,11 +461,16 @@ class CaptureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_export_form(self, error: str | None = None, values: dict[str, str] | None = None) -> None:
+    def _serve_export_form(
+        self,
+        error: str | None = None,
+        values: dict[str, str] | None = None,
+        queued: bool = False,
+    ) -> None:
         if not EXPORT_PASSWORD:
             body = export_disabled_html().encode()
         else:
-            body = export_form_html(error=error, values=values).encode()
+            body = export_form_html(error=error, values=values, queued=queued).encode()
 
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -421,30 +597,57 @@ class CaptureHandler(BaseHTTPRequestHandler):
             )
             return
 
-        output_path: Path | None = None
-        try:
-            output_path = build_timelapse_mp4(
-                images,
-                options.fps,
-                EXPORT_TIMEZONE,
-                options.burn_in_timestamp,
-            )
-            data = output_path.read_bytes()
-            filename = f"timelapse-{datetime.now().strftime('%Y-%m-%d')}.mp4"
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header(
-                "Content-Disposition",
-                f'attachment; filename="{filename}"',
-            )
-            self.end_headers()
-            self.wfile.write(data)
-        except RuntimeError as exc:
-            self._serve_export_form(error=str(exc), values=values)
-        finally:
-            if output_path is not None and output_path.exists():
-                output_path.unlink(missing_ok=True)
+        ensure_exports_dir()
+        label = _export_label(options, len(images))
+        job = create_job(label, len(images))
+        thread = threading.Thread(
+            target=_run_export_job,
+            args=(job.export_id, images, options, EXPORT_TIMEZONE),
+            daemon=True,
+        )
+        thread.start()
+
+        self.send_response(303)
+        self.send_header("Location", "/export?queued=1")
+        self.end_headers()
+
+    def _serve_exports_status(self) -> None:
+        jobs = list_jobs()
+        payload = [
+            {
+                "export_id": job.export_id,
+                "status": job.status,
+                "percent": round(job.percent, 1),
+                "message": job.message,
+                "error": job.error,
+            }
+            for job in jobs
+        ]
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_export_download(self, export_id: str) -> None:
+        job = load_job(export_id)
+        if job is None or job.status != "done" or not job.mp4_path.is_file():
+            self.send_error(404, "Export not found")
+            return
+
+        data = job.mp4_path.read_bytes()
+        filename = job.filename or f"{export_id}.mp4"
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{filename}"',
+        )
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_image(self) -> None:
         image = newest_image(CAPTURES_DIR)
@@ -481,6 +684,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    ensure_exports_dir()
     server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), CaptureHandler)
     print(f"Serving latest capture from {CAPTURES_DIR} on port {WEB_PORT}")
     server.serve_forever()

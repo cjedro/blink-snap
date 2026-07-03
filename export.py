@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -14,6 +15,8 @@ from zoneinfo import ZoneInfo
 IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 FILENAME_TS_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
 SECONDS_PER_DAY = 86400
+
+ProgressCallback = Callable[[float, str], None]
 
 
 @dataclass(frozen=True)
@@ -144,26 +147,46 @@ def stamp_image_with_timestamp(source: Path, dest: Path, label: str) -> None:
 
 def build_timelapse_mp4(
     images: list[Path],
+    output_path: Path,
     fps: float,
     export_timezone: str = "UTC",
     burn_in_timestamp: bool = True,
-) -> Path:
+    progress: ProgressCallback | None = None,
+) -> None:
     if not images:
         raise ValueError("No images to export")
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg is not installed or not on PATH")
 
+    total_images = len(images)
+    total_steps = total_images + 1
+
+    def report(step: int, message: str) -> None:
+        if progress is not None:
+            percent = min(100.0, (step / total_steps) * 100)
+            progress(percent, message)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix="blink-snap-export-"))
     try:
         for index, image in enumerate(images, start=1):
             dest = work_dir / f"{index:06d}.jpg"
             if burn_in_timestamp:
+                report(
+                    index - 1,
+                    f"Adding burn-in on picture {index}/{total_images}…",
+                )
                 label = format_burnin_timestamp(image, export_timezone)
                 stamp_image_with_timestamp(image, dest, label)
             else:
+                report(
+                    index - 1,
+                    f"Preparing picture {index}/{total_images}…",
+                )
                 dest.symlink_to(image.resolve())
 
-        output = work_dir / "output.mp4"
+        report(total_images, "Encoding video…")
+        temp_output = work_dir / "output.mp4"
         result = subprocess.run(
             [
                 "ffmpeg",
@@ -179,7 +202,7 @@ def build_timelapse_mp4(
                 "libx264",
                 "-pix_fmt",
                 "yuv420p",
-                str(output),
+                str(temp_output),
             ],
             cwd=work_dir,
             capture_output=True,
@@ -190,11 +213,7 @@ def build_timelapse_mp4(
             stderr = result.stderr.strip() or "ffmpeg failed"
             raise RuntimeError(stderr)
 
-        data = output.read_bytes()
-        fd, final_name = tempfile.mkstemp(suffix=".mp4", prefix="blink-snap-timelapse-")
-        os.close(fd)
-        final = Path(final_name)
-        final.write_bytes(data)
-        return final
+        report(total_steps, "Export complete")
+        shutil.move(str(temp_output), str(output_path))
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

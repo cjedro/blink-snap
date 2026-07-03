@@ -1,6 +1,6 @@
 services:
   blink-snap:
-    image: cjedro/blink-snap:0.0.1
+    image: cjedro/blink-snap:0.0.7
     pull_policy: always
     environment:
       BLINK_USERNAME: ${BLINK_USERNAME}
@@ -15,4 +15,5 @@ services:
     volumes:
       - ./blink_session.json:/data/blink_session.json
       - ./captures:/data/captures
+      - ./exports:/data/exports
     restart: unless-stopped
