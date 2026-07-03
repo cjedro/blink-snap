@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -33,6 +35,8 @@ CAPTURES_DIR = Path(os.getenv("CAPTURES_DIR", "/data/captures"))
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 EXPORT_PASSWORD = os.getenv("EXPORT_PASSWORD", "")
 EXPORT_TIMEZONE = os.getenv("EXPORT_TIMEZONE", "UTC")
+EXPORT_COOKIE_NAME = "export_auth"
+EXPORT_COOKIE_MAX_AGE = int(os.getenv("EXPORT_COOKIE_MAX_AGE", str(7 * 24 * 3600)))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 
 EXPORT_CSS = (
@@ -104,9 +108,13 @@ function pollExports() {
   if (!table) return;
   var active = table.querySelectorAll('[data-status="queued"],[data-status="running"]');
   if (active.length === 0) return;
-  fetch('/export/status')
-    .then(function(response) { return response.json(); })
+  fetch('/export/status', { credentials: 'same-origin' })
+    .then(function(response) {
+      if (response.status === 401) return null;
+      return response.json();
+    })
     .then(function(jobs) {
+      if (!jobs) return;
       jobs.forEach(function(job) {
         var row = document.getElementById('export-' + job.export_id);
         if (!row) return;
@@ -279,6 +287,37 @@ def _run_export_job(
         )
 
 
+def _export_auth_token() -> str:
+    return hmac.new(
+        EXPORT_PASSWORD.encode("utf-8"),
+        b"blink-snap-export-v1",
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def export_login_html(error: str | None = None) -> str:
+    error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    return (
+        "<!DOCTYPE html>"
+        '<html><head><meta charset="utf-8">'
+        "<title>Export Timelapse</title>"
+        f"<style>{EXPORT_CSS}</style>"
+        "</head><body><main>"
+        "<h1>Export Timelapse</h1>"
+        f"{error_html}"
+        '<p class="hint">Enter the export password to queue and download timelapses.</p>'
+        '<form method="post" action="/export/login">'
+        "<label>Password"
+        '<input type="password" name="password" required autocomplete="current-password">'
+        "</label>"
+        '<div class="actions">'
+        '<button type="submit">Continue</button>'
+        '<a href="/">Back</a>'
+        "</div>"
+        "</form></main></body></html>"
+    )
+
+
 def export_form_html(
     error: str | None = None,
     values: dict[str, str] | None = None,
@@ -319,9 +358,6 @@ def export_form_html(
         f"{error_html}"
         f'<p class="hint">{hint}</p>'
         '<form method="post" action="/export" onsubmit="return disableExportSubmit(this)">'
-        "<label>Password"
-        '<input type="password" name="password" required autocomplete="current-password">'
-        "</label>"
         "<fieldset>"
         "<legend>Date range</legend>"
         f'<label><input type="radio" name="scope" value="whole"{" checked" if scope == "whole" else ""} '
@@ -364,6 +400,7 @@ def export_form_html(
         "</fieldset>"
         '<div class="actions">'
         '<button type="submit">Queue Export</button>'
+        '<a href="/export/logout">Log out</a>'
         '<a href="/">Back</a>'
         "</div>"
         "</form>"
@@ -401,6 +438,8 @@ class CaptureHandler(BaseHTTPRequestHandler):
             query = parse_qs(urlparse(self.path).query)
             queued = _field(query, "queued") == "1"
             self._serve_export_form(queued=queued)
+        elif path == "/export/logout":
+            self._handle_export_logout()
         elif path == "/export/status":
             self._serve_exports_status()
         elif path.startswith("/export/download/"):
@@ -410,10 +449,82 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path == "/export":
+        if path == "/export/login":
+            self._handle_export_login()
+        elif path == "/export":
             self._handle_export()
         else:
             self.send_error(404)
+
+    def _parse_cookies(self) -> dict[str, str]:
+        cookies: dict[str, str] = {}
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, value = part.split("=", 1)
+                cookies[name.strip()] = value.strip()
+        return cookies
+
+    def _export_authenticated(self) -> bool:
+        if not EXPORT_PASSWORD:
+            return False
+        token = self._parse_cookies().get(EXPORT_COOKIE_NAME, "")
+        expected = _export_auth_token()
+        return bool(token) and secrets.compare_digest(token, expected)
+
+    def _export_cookie_header(self, token: str, max_age: int) -> str:
+        parts = [
+            f"{EXPORT_COOKIE_NAME}={token}",
+            "Path=/export",
+            "HttpOnly",
+            "SameSite=Lax",
+            f"Max-Age={max_age}",
+        ]
+        if os.getenv("EXPORT_COOKIE_SECURE", "").lower() in ("1", "true", "yes"):
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _set_export_auth_cookie(self) -> None:
+        self.send_header("Set-Cookie", self._export_cookie_header(_export_auth_token(), EXPORT_COOKIE_MAX_AGE))
+
+    def _clear_export_auth_cookie(self) -> None:
+        self.send_header("Set-Cookie", self._export_cookie_header("", 0))
+
+    def _require_export_auth(self) -> bool:
+        if self._export_authenticated():
+            return True
+        return False
+
+    def _handle_export_login(self) -> None:
+        if not EXPORT_PASSWORD:
+            self._serve_export_form()
+            return
+
+        params = self._read_form()
+        password = _field(params, "password")
+        if not secrets.compare_digest(password, EXPORT_PASSWORD):
+            self._serve_export_login(error="Incorrect password.")
+            return
+
+        self.send_response(303)
+        self.send_header("Location", "/export")
+        self._set_export_auth_cookie()
+        self.end_headers()
+
+    def _handle_export_logout(self) -> None:
+        self.send_response(303)
+        self.send_header("Location", "/export")
+        self._clear_export_auth_cookie()
+        self.end_headers()
+
+    def _serve_export_login(self, error: str | None = None) -> None:
+        body = export_login_html(error=error).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_page(self) -> None:
         image = newest_image(CAPTURES_DIR)
@@ -469,6 +580,9 @@ class CaptureHandler(BaseHTTPRequestHandler):
     ) -> None:
         if not EXPORT_PASSWORD:
             body = export_disabled_html().encode()
+        elif not self._export_authenticated():
+            self._serve_export_login(error=error)
+            return
         else:
             body = export_form_html(error=error, values=values, queued=queued).encode()
 
@@ -569,13 +683,14 @@ class CaptureHandler(BaseHTTPRequestHandler):
             self._serve_export_form()
             return
 
+        if not self._export_authenticated():
+            self.send_response(303)
+            self.send_header("Location", "/export")
+            self.end_headers()
+            return
+
         params = self._read_form()
         values = self._form_values(params)
-        password = _field(params, "password")
-
-        if not secrets.compare_digest(password, EXPORT_PASSWORD):
-            self._serve_export_form(error="Incorrect password.", values=values)
-            return
 
         options, error = self._parse_export_options(params)
         if error or options is None:
@@ -609,9 +724,13 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
         self.send_response(303)
         self.send_header("Location", "/export?queued=1")
+        self._set_export_auth_cookie()
         self.end_headers()
 
     def _serve_exports_status(self) -> None:
+        if not self._require_export_auth():
+            self.send_error(401, "Unauthorized")
+            return
         jobs = list_jobs()
         payload = [
             {
@@ -632,6 +751,10 @@ class CaptureHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_export_download(self, export_id: str) -> None:
+        if not self._require_export_auth():
+            self.send_error(401, "Unauthorized")
+            return
+
         job = load_job(export_id)
         if job is None or job.status != "done" or not job.mp4_path.is_file():
             self.send_error(404, "Export not found")
