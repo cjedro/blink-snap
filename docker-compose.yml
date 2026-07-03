@@ -8,6 +8,8 @@ services:
       CAMERA: ${CAMERA}
       INTERVAL: ${INTERVAL}
       WEB_PORT: ${WEB_PORT:-8080}
+      EXPORT_PASSWORD: ${EXPORT_PASSWORD:-}
+      EXPORT_TIMEZONE: ${EXPORT_TIMEZONE:-UTC}
     ports:
       - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
     volumes:
