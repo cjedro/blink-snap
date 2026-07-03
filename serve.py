@@ -135,6 +135,10 @@ def export_form_html(
     scope = values.get("scope", "whole")
     skip_hours = values.get("skip_hours") == "1"
     custom_fps = values.get("custom_fps") == "1"
+    if not values:
+        burn_in_timestamp = True
+    else:
+        burn_in_timestamp = values.get("burn_in_timestamp") == "1"
     skip_from = int(values.get("skip_from", "22"))
     skip_to = int(values.get("skip_to", "6"))
     fps_value = values.get("fps", f"{default_fps:g}")
@@ -179,6 +183,12 @@ def export_form_html(
         "<span>to</span>"
         f'<select name="skip_to" id="skip_to">{_hour_options(skip_to)}</select>'
         "</div>"
+        "</fieldset>"
+        "<fieldset>"
+        "<legend>Overlay</legend>"
+        f'<label><input type="checkbox" name="burn_in_timestamp" id="burn_in_timestamp" value="1"'
+        f'{" checked" if burn_in_timestamp else ""}> '
+        "Burn in timestamp (dd/mm/YYYY HH:00, local time)</label>"
         "</fieldset>"
         "<fieldset>"
         "<legend>Frame rate</legend>"
@@ -310,6 +320,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
             values["skip_hours"] = "1"
         if _checkbox(params, "custom_fps"):
             values["custom_fps"] = "1"
+        values["burn_in_timestamp"] = "1" if _checkbox(params, "burn_in_timestamp") else "0"
         return values
 
     def _parse_export_options(
@@ -361,6 +372,8 @@ class CaptureHandler(BaseHTTPRequestHandler):
         else:
             fps = default_fps_from_interval(interval)
 
+        burn_in_timestamp = _checkbox(params, "burn_in_timestamp")
+
         return (
             ExportOptions(
                 scope=scope,
@@ -370,6 +383,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 skip_from=skip_from,
                 skip_to=skip_to,
                 fps=fps,
+                burn_in_timestamp=burn_in_timestamp,
             ),
             None,
         )
@@ -409,7 +423,12 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
         output_path: Path | None = None
         try:
-            output_path = build_timelapse_mp4(images, options.fps)
+            output_path = build_timelapse_mp4(
+                images,
+                options.fps,
+                EXPORT_TIMEZONE,
+                options.burn_in_timestamp,
+            )
             data = output_path.read_bytes()
             filename = f"timelapse-{datetime.now().strftime('%Y-%m-%d')}.mp4"
             self.send_response(200)

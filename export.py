@@ -25,6 +25,7 @@ class ExportOptions:
     skip_from: int
     skip_to: int
     fps: float
+    burn_in_timestamp: bool
 
 
 def capture_interval_seconds() -> int | None:
@@ -102,7 +103,51 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def build_timelapse_mp4(images: list[Path], fps: float) -> Path:
+def format_burnin_timestamp(path: Path, export_timezone: str) -> str:
+    dt_utc = parse_capture_timestamp(path)
+    if dt_utc is None:
+        return ""
+    return dt_utc.astimezone(ZoneInfo(export_timezone)).strftime("%d/%m/%Y %H:00")
+
+
+def _escape_drawtext(text: str) -> str:
+    return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def stamp_image_with_timestamp(source: Path, dest: Path, label: str) -> None:
+    escaped = _escape_drawtext(label)
+    vf = (
+        f"drawtext=text='{escaped}':fontsize=28:fontcolor=white:"
+        "box=1:boxcolor=black@0.5:boxborderw=8:x=16:y=h-th-16"
+    )
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-vf",
+            vf,
+            str(dest),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "ffmpeg stamp failed"
+        raise RuntimeError(stderr)
+
+
+def build_timelapse_mp4(
+    images: list[Path],
+    fps: float,
+    export_timezone: str = "UTC",
+    burn_in_timestamp: bool = True,
+) -> Path:
     if not images:
         raise ValueError("No images to export")
     if not ffmpeg_available():
@@ -111,8 +156,12 @@ def build_timelapse_mp4(images: list[Path], fps: float) -> Path:
     work_dir = Path(tempfile.mkdtemp(prefix="blink-snap-export-"))
     try:
         for index, image in enumerate(images, start=1):
-            link = work_dir / f"{index:06d}.jpg"
-            link.symlink_to(image.resolve())
+            dest = work_dir / f"{index:06d}.jpg"
+            if burn_in_timestamp:
+                label = format_burnin_timestamp(image, export_timezone)
+                stamp_image_with_timestamp(image, dest, label)
+            else:
+                dest.symlink_to(image.resolve())
 
         output = work_dir / "output.mp4"
         result = subprocess.run(
