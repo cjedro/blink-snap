@@ -1,5 +1,6 @@
 # Future local captures
 captures/
+exports/
 *.jpg
 *.jpeg
 *.mp4

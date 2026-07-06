@@ -1,6 +1,6 @@
 services:
   blink-snap:
-    image: cjedro/blink-snap:0.0.1
+    image: cjedro/blink-snap:0.0.8
     pull_policy: always
     environment:
       BLINK_USERNAME: ${BLINK_USERNAME}
@@ -8,9 +8,13 @@ services:
       CAMERA: ${CAMERA}
       INTERVAL: ${INTERVAL}
       WEB_PORT: ${WEB_PORT:-8080}
+      EXPORT_PASSWORD: ${EXPORT_PASSWORD:-}
+      EXPORT_TIMEZONE: ${EXPORT_TIMEZONE:-UTC}
+      EXPORT_COOKIE_SECURE: ${EXPORT_COOKIE_SECURE:-false}
     ports:
       - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
     volumes:
       - ./blink_session.json:/data/blink_session.json
       - ./captures:/data/captures
+      - ./exports:/data/exports
     restart: unless-stopped
