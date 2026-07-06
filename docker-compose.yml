@@ -1,6 +1,6 @@
 services:
   blink-snap:
-    image: cjedro/blink-snap:0.0.8
+    image: ghcr.io/cjedro/blink-snap:latest
     pull_policy: always
     environment:
       BLINK_USERNAME: ${BLINK_USERNAME}

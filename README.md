@@ -69,7 +69,7 @@ Runs the interval watch loop in a container. Credentials and settings come from 
 docker compose --env-file .env.docker up -d
 ```
 
-Uses the published image `cjedro/blink-snap:latest` (pulls on start).
+Uses the published image `ghcr.io/cjedro/blink-snap:latest` (pulls on start).
 
 Volumes (in `docker-compose.yml`):
 
@@ -89,7 +89,7 @@ docker run -d --name blink-snap \
   -v "$(pwd)/blink_session.json:/data/blink_session.json" \
   -v "$(pwd)/captures:/data/captures" \
   --restart unless-stopped \
-  cjedro/blink-snap:latest
+  ghcr.io/cjedro/blink-snap:latest
 ```
 
 The container has no TTY — **create `blink_session.json` on the host first** (2FA step). After that, the container refreshes tokens and writes the updated session back to the mounted file.
