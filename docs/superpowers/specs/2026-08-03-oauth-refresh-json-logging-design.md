@@ -1,8 +1,13 @@
 # Design: OAuth v2 mid-session refresh + JSON logging
 
 Date: 2026-08-03  
-Status: approved for implementation planning  
-Scope: `snap.py`, `docker-entrypoint.sh` (optional env passthrough); not `serve.py` rewrite
+Status: approved for implementation planning (amended)  
+Scope: `snap.py`, `docker-entrypoint.sh` (optional); README note for `LOG_LEVEL`  
+Out of scope: rewriting Blink OAuth, forking blinkpy, `serve.py` log overhaul
+
+## Constraint
+
+**Prefer blinkpy APIs everywhere.** Do not reimplement OAuth token HTTP calls, login flows, or session serialization. Only monkey-patch the one blinkpy method that is wrong for OAuth v2 mid-session refresh (`Auth.refresh_tokens`), by **delegating to existing blinkpy helpers** (`api.oauth_refresh_token`, `Auth._process_token_data`, `Auth.startup`). Persist sessions with `blink.save()`.
 
 ## Problem
 
@@ -24,107 +29,127 @@ Blink tokens are obtained via **OAuth v2** (`client_id=ios`, `hardware_id`).
 | Startup | `Auth.startup()` | `api.oauth_refresh_token()` with iOS client + `hardware_id` |
 | Mid-session | `Auth.query()` → `need_refresh()` → `Auth.refresh_tokens()` | Legacy `request_login(..., is_refresh=True)` with `client_id=android`, no real `hardware_id` |
 
-Access tokens expire in ~4 hours (`expires_in=14400`). When refresh is needed mid-watch, blinkpy uses the legacy Android refresh against an iOS-issued refresh token. That fails with a generic `LoginError`, which blinkpy logs as `Login endpoint failed. Try again later.` and raises `TokenRefreshFailed`.
+Access tokens expire in ~4 hours (`expires_in=14400`). Mid-session refresh uses the legacy Android path against an iOS-issued refresh token → `LoginError` → blinkpy logs `Login endpoint failed. Try again later.` → `TokenRefreshFailed`.
 
-The watch loop catches the exception, sleeps, and retries. Every later capture hits `need_refresh()` again and fails the same way. Restart works because `startup()` uses the correct OAuth v2 refresh.
+The watch loop catches the exception and retries; every later capture hits the same broken refresh. Restart works because `startup()` uses OAuth v2 refresh.
 
 ## Goals
 
-1. Fix mid-session token refresh so long-running watch mode survives access-token expiry without a container restart.
-2. Emit structured JSON logs (verbose enough to diagnose auth/capture failures next time).
-3. Soft-reconnect in the watch loop if refresh still fails.
+1. Fix mid-session token refresh so watch mode survives access-token expiry without a container restart.
+2. Emit structured JSON logs verbose enough to diagnose auth/capture failures.
+3. Soft-reconnect in the watch loop if refresh still fails (still via blinkpy `start` / `startup`).
 
 ## Non-goals
 
-- Rewriting `serve.py` access/export HTTP logging
-- Replacing blinkpy with a custom Blink client
-- Proactive Docker restart / healthcheck-based bounce as the primary fix
+- Rewriting `serve.py` HTTP logging
+- Custom Blink HTTP client or copy-pasted OAuth token requests
+- Forking / vendoring blinkpy
+- Proactive Docker restart as the primary fix
 - Logging passwords, access tokens, or refresh tokens
 
 ## Approach
 
-**Option A (chosen):** Monkey-patch blinkpy’s mid-session refresh to use OAuth v2 (same pattern as the existing `_patch_blinkpy_oauth_signin`), plus watch-loop reconnect and JSON logging.
+**Option A (chosen):** Monkey-patch `Auth.refresh_tokens` so it calls blinkpy’s existing OAuth v2 refresh path (same idea as the existing `_patch_blinkpy_oauth_signin`), plus watch-loop reconnect using blinkpy connect/start, plus JSON logging in our process.
 
 ### Alternatives considered
 
 | Option | Summary | Why not |
 |--------|---------|---------|
-| Soft reconnect only | On auth error, call `connect_blink` again | Still fails every ~4h until reconnect; does not fix the bad refresh path |
-| Replace blinkpy auth | Own full OAuth client | Out of scope for this incident |
+| Soft reconnect only | On auth error, `connect_blink` again | Still fails every ~4h until reconnect; leaves broken refresh in place |
+| Replace / reimplement Blink auth | Own token HTTP + login | Violates “use blinkpy” constraint; out of scope |
 
 ## Design
 
-### 1. Monkey-patch `Auth.refresh_tokens`
+### 1. Monkey-patch `Auth.refresh_tokens` (thin wrapper over blinkpy)
 
-Extend the blinkpy patching already done in `snap.py`:
+Replace `Auth.refresh_tokens` at import time (alongside the existing sign-in patch). Implementation must **only** call blinkpy:
 
-1. Prefer `api.oauth_refresh_token(auth, refresh_token, hardware_id)`.
-2. On success, call `auth._process_token_data(token_data)` (or equivalent field updates already used at startup).
-3. If OAuth v2 refresh returns no token data or errors, fall back to `await auth.startup()` (full OAuth v2 login/refresh path used at process start).
-4. If both fail, raise `TokenRefreshFailed` with a useful chained cause.
-5. Log structured events: which path was used (`oauth_v2` vs `startup_fallback`), HTTP status / short body snippet when available, seconds until prior expiry — never secrets.
+1. If `refresh_token` and `hardware_id` are present, call `api.oauth_refresh_token(auth, refresh_token, hardware_id)`.
+2. On truthy token data, call `await auth._process_token_data(token_data)`, clear `auth.is_errored`, return `True`.
+3. Else fall back to `await auth.startup()` (blinkpy’s own startup already tries OAuth v2 refresh, then full OAuth login).
+4. On success after fallback, clear `is_errored` and return `True`.
+5. Catch `BlinkTwoFARequiredError` from `startup()`: do **not** prompt; log and raise `TokenRefreshFailed` (headless-safe).
+6. On any other failure, raise `TokenRefreshFailed` with cause chained.
+
+Do **not** reimplement the token POST, headers, or client_id selection — that stays inside blinkpy’s `oauth_refresh_token` / `startup`.
+
+**HTTP status logging caveat:** `api.oauth_refresh_token` returns `None` on non-200 and does not expose status/body. Accept that limitation: log `refresh_path`, presence of tokens/`hardware_id`, exception type/message, and whether fallback ran. Do **not** duplicate the HTTP call just to capture status.
 
 Keep the existing `oauth_signin` 202/412 patch unchanged.
 
-### 2. Watch-loop recovery
+### 2. Persist session immediately after refresh (via blinkpy)
 
-In `watch_loop`:
+Refresh tokens may rotate. Saving only after a successful capture is unsafe.
 
-- On `TokenRefreshFailed`, `LoginError`, or related unauthorized/auth failures:
-  - Log `reconnect` attempt with capture number and error type.
-  - Re-run connect/login via existing `connect_blink` (or equivalent) using the same `ClientSession` / session path.
-  - Re-resolve the camera by name.
-  - Continue the loop on success; on failure log `reconnect_fail` and wait for the next interval (do not exit the process).
-- On other capture errors: log full exception type + message (+ traceback at DEBUG).
-- Save session after successful capture, successful mid-session refresh (if we own that save point), and successful reconnect.
+- After `connect_blink` / successful start, set `blink.auth.callback` to schedule persistence of `blink.auth.login_attributes` through blinkpy’s `blink.save(session_path)` (async: `asyncio.create_task` / equivalent from the sync callback).
+- Also `await blink.save(...)` after successful capture and after successful watch-loop reconnect (same as today, plus reconnect).
+- Do **not** hand-roll JSON session writes; use `blink.save`.
 
-### 3. JSON logging
+### 3. Watch-loop recovery (blinkpy reconnect, no process exit)
 
-- Configure `logging` with a JSON formatter writing one object per line to stderr.
-- Core fields: `ts` (ISO-8601 UTC), `level`, `logger`, `msg`.
-- Event field `event` for machine parsing, including at least:
-  - `startup`
-  - `capture_ok`
-  - `capture_fail`
-  - `token_refresh`
-  - `token_refresh_fail`
-  - `reconnect`
-  - `reconnect_fail`
-- Contextual fields when relevant: `capture`, `camera`, `mode`, `path`, `error_type`, `http_status`, `refresh_path`, `expires_in_s`.
-- Move operational watch/auth messages from bare `print` to the logger where practical; keep interactive CLI prompts (2FA input) as human text on stderr/stdout.
-- Default level: **INFO** (especially in Docker).
-- Overrides: `--verbose` / `-v` → DEBUG; env `LOG_LEVEL` (`DEBUG|INFO|WARNING|ERROR`).
-- blinkpy loggers: INFO by default; DEBUG when app is DEBUG so library refresh details are visible without always flooding.
+Refactor helpers so recovery cannot `sys.exit`:
 
-### 4. Docker / CLI wiring
+- Split **fatal CLI exit** from **reconnectable errors**: `connect_blink` (or a sibling used by watch mode) must raise/return failure instead of `sys.exit` when called from the watch loop. One-shot CLI can still exit non-zero at `main` / `run`.
+- Same for camera resolve when used from reconnect: return/raise, don’t `sys.exit` inside the loop.
+- On `TokenRefreshFailed`, `LoginError`, `UnauthorizedError` (and `BlinkTwoFARequiredError` if it escapes):
+  - Log `reconnect` with capture # and `error_type`.
+  - Rebuild auth via blinkpy: reload session with existing `load_login_data`, `Auth(...)`, `await blink.start()` (and 2FA only if interactive CLI — in Docker/watch, treat 2FA as reconnect failure).
+  - Re-resolve camera; on success continue; on failure log `reconnect_fail` and sleep until next interval (**do not exit** the process).
+- Other capture errors: log type + message (traceback at DEBUG) and continue.
 
-- `docker-entrypoint.sh`: honor optional `LOG_LEVEL` (document in README).
-- No change required to compose volume layout.
-- Existing `-v` continues to work for local CLI runs.
+### 4. JSON logging
+
+- JSON formatter → one object per line on stderr.
+- Core: `ts` (ISO-8601 UTC), `level`, `logger`, `msg`.
+- `event` values: `startup`, `capture_ok`, `capture_fail`, `token_refresh`, `token_refresh_fail`, `reconnect`, `reconnect_fail`.
+- Context when relevant: `capture`, `camera`, `mode`, `path`, `error_type`, `refresh_path` (`oauth_v2` / `startup_fallback`), `expires_in_s`, `has_refresh_token`, `has_hardware_id`.
+- Omit `http_status` unless blinkpy surfaces it without a custom HTTP client (see caveat above).
+- Operational watch/auth messages via `logging`; keep interactive 2FA prompts as human text.
+- Default level **INFO** (behavior change from today’s WARNING — intentional for Docker).
+- Overrides: `-v` / `--verbose` → DEBUG; `LOG_LEVEL` env read in `snap.py` (`DEBUG|INFO|WARNING|ERROR`).
+- blinkpy loggers: INFO normally; DEBUG when app DEBUG.
+
+### 5. Docker / CLI
+
+- `snap.py` reads `LOG_LEVEL` directly; entrypoint need not translate it (optional doc only).
+- Document `LOG_LEVEL` in README.
+- No volume/layout changes.
 
 ## Error handling
 
 | Failure | Behavior |
 |---------|----------|
-| OAuth v2 refresh HTTP non-200 | Log status + short body; try `startup()` fallback |
-| `startup()` needs 2FA in container | Log clearly; reconnect fails; process keeps interval (operator must re-auth interactively on host) |
-| Transient network error | Log and retry next interval |
-| Non-auth capture error | Log and continue |
+| `oauth_refresh_token` returns `None` | Log `token_refresh_fail`; call blinkpy `startup()` fallback |
+| `startup()` raises `BlinkTwoFARequiredError` | Log headless-safe message; raise `TokenRefreshFailed`; watch reconnect may fail until interactive host re-auth |
+| Transient network / other capture errors | Log and retry next interval |
+| Reconnect failure | Log `reconnect_fail`; do not exit; wait for interval |
 
 ## Testing
 
-- Unit-style: patch/mock `oauth_refresh_token` success and failure paths; assert refresh path selection and that `TokenRefreshFailed` is raised only after both paths fail.
-- Manual / Docker: run with short forced expiry simulation (mock `expiration_date` in past) and confirm refresh succeeds without restart; confirm JSON log lines on success/failure.
-- Regression: `--list` and one-shot capture still work; 2FA interactive path unchanged.
+Repo currently has no test suite. Keep verification lean and blinkpy-oriented:
+
+- Prefer a small scripted/manual check: force `auth.expiration_date` into the past after a real `connect_blink`, trigger one capture/refresh, confirm success and session file update via `blink.save`.
+- Optional later: pytest with mocks of `api.oauth_refresh_token` only if we add a test harness; not required for this change.
+- Regression: `--list`, one-shot capture, interactive 2FA path unchanged.
 
 ## Rollout
 
-1. Implement + test locally.
-2. Bump image / tag as usual for this repo’s publish workflow.
-3. Redeploy compose service; monitor JSON logs around the 4h mark.
+1. Implement + manual verify locally / Docker.
+2. Publish image per existing workflow; redeploy compose.
+3. Monitor JSON logs around the ~4h mark.
 
 ## Success criteria
 
-- Watch mode continues capturing after access-token expiry without container restart.
-- Failed auth/capture emits JSON logs with `event`, `error_type`, and enough HTTP/context fields to diagnose without secrets.
+- Watch mode keeps capturing after access-token expiry without container restart.
+- Auth/capture failures emit JSON with `event` + `error_type` (and refresh context fields above).
+- No custom Blink OAuth HTTP implementation; only the thin `refresh_tokens` monkey-patch plus our logging/reconnect orchestration.
 - Restart is no longer required for the known mid-session refresh failure mode.
+
+## Amendments (vs first draft)
+
+1. Reconnect must not reuse `sys.exit`-ing helpers as-is.
+2. Persist session immediately after refresh via blinkpy `save` / `callback` (token rotation).
+3. Headless-safe handling of `BlinkTwoFARequiredError` (no `input()` in Docker watch).
+4. Do not reimplement token HTTP for status codes; use blinkpy and log what it exposes.
+5. Soften testing to manual/blinkpy-driven verification unless a harness is added.
+6. Explicit constraint: use blinkpy wherever possible; patch only `refresh_tokens`.
