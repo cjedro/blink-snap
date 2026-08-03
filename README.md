@@ -40,9 +40,11 @@ python snap.py --camera "Living Room" --interval 300
 
 ### Watch mode (`--interval`)
 
-Runs forever, taking one picture every `SECONDS` (minimum **60** — Blink asks clients not to poll faster than once per minute). Uses thumbnail mode only. Token refresh happens automatically; the session file is updated after each successful capture. Press **Ctrl+C** to stop.
+Runs forever, taking one picture every `SECONDS` (minimum **60** — Blink asks clients not to poll faster than once per minute). Uses thumbnail mode only. Mid-session token refresh uses Blink OAuth v2 (via blinkpy); the session file is updated after refresh and after each successful capture. On auth failure the watch loop reconnects without exiting. Press **Ctrl+C** to stop.
 
-CLI args can be replaced with env vars: `CAMERA` / `BLINK_CAMERA`, `INTERVAL` / `BLINK_INTERVAL`, `BLINK_OUTPUT`, `BLINK_SESSION`.
+Operational logs are JSON lines on stderr. Default level is `INFO`. Set `LOG_LEVEL=DEBUG` (or pass `-v`) for more detail.
+
+CLI args can be replaced with env vars: `CAMERA` / `BLINK_CAMERA`, `INTERVAL` / `BLINK_INTERVAL`, `BLINK_OUTPUT`, `BLINK_SESSION`, `LOG_LEVEL`.
 
 ## Docker
 

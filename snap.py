@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -13,12 +14,20 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from aiohttp import ClientSession
 from blinkpy import api as blink_api
-from blinkpy.auth import Auth, BlinkTwoFARequiredError, LoginError, TokenRefreshFailed
+from blinkpy.auth import (
+    Auth,
+    BlinkTwoFARequiredError,
+    LoginError,
+    TokenRefreshFailed,
+    UnauthorizedError,
+)
 from blinkpy.blinkpy import Blink
 from blinkpy.helpers.constants import OAUTH_SIGNIN_URL, OAUTH_USER_AGENT
 from blinkpy.helpers.util import json_load
@@ -29,6 +38,78 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = SCRIPT_DIR / "captures"
 DEFAULT_SESSION = SCRIPT_DIR / "blink_session.json"
 MIN_INTERVAL_SECONDS = 60
+LOGGER = logging.getLogger("blink-snap")
+AUTH_LOGGER = logging.getLogger("blink-snap.auth")
+
+_JSON_EXTRA_KEYS = (
+    "event",
+    "capture",
+    "camera",
+    "mode",
+    "path",
+    "error_type",
+    "refresh_path",
+    "expires_in_s",
+    "has_refresh_token",
+    "has_hardware_id",
+)
+
+AUTH_ERRORS = (
+    TokenRefreshFailed,
+    LoginError,
+    UnauthorizedError,
+    BlinkTwoFARequiredError,
+)
+
+
+class BlinkConnectError(RuntimeError):
+    """Raised when Blink login/setup fails without exiting the process."""
+
+
+class CameraNotFoundError(ValueError):
+    """Raised when the requested camera name cannot be resolved."""
+
+
+WATCH_RECOVERABLE_ERRORS = AUTH_ERRORS + (BlinkConnectError, CameraNotFoundError)
+
+
+class JsonFormatter(logging.Formatter):
+    """Emit one JSON object per log line for machine-friendly Docker logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key in _JSON_EXTRA_KEYS:
+            value = record.__dict__.get(key)
+            if value is not None:
+                payload[key] = value
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info).strip()
+        return json.dumps(payload, default=str)
+
+
+def resolve_log_level(verbose: bool) -> int:
+    if verbose:
+        return logging.DEBUG
+    name = (os.getenv("LOG_LEVEL") or "INFO").upper()
+    return getattr(logging, name, logging.INFO)
+
+
+def configure_logging(level: int) -> None:
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(JsonFormatter())
+    root.addHandler(handler)
+    root.setLevel(level)
+    for name in ("blinkpy", "blinkpy.auth", "blinkpy.api", "blinkpy.blinkpy"):
+        logging.getLogger(name).setLevel(level)
 
 
 def _patch_blinkpy_oauth_signin() -> None:
@@ -60,17 +141,139 @@ def _patch_blinkpy_oauth_signin() -> None:
             return "SUCCESS"
 
         body = await response.text()
-        logging.error(
+        AUTH_LOGGER.error(
             "Blink sign-in failed (HTTP %s): %s",
             response.status,
             body[:200],
+            extra={"event": "token_refresh_fail", "error_type": f"HTTP_{response.status}"},
         )
         return None
 
     blink_api.oauth_signin = oauth_signin
 
 
+def _patch_blinkpy_refresh_tokens() -> None:
+    """Use blinkpy OAuth v2 refresh mid-session instead of legacy Android login."""
+
+    async def refresh_tokens(self, refresh=False):
+        self.is_errored = True
+        expires_in_s = (
+            None
+            if self.expiration_date is None
+            else round(self.expiration_date - time.time(), 3)
+        )
+        context = {
+            "expires_in_s": expires_in_s,
+            "has_refresh_token": bool(self.refresh_token),
+            "has_hardware_id": bool(self.hardware_id),
+        }
+
+        try:
+            if self.refresh_token and self.hardware_id:
+                AUTH_LOGGER.info(
+                    "Attempting OAuth v2 token refresh",
+                    extra={"event": "token_refresh", "refresh_path": "oauth_v2", **context},
+                )
+                token_data = await blink_api.oauth_refresh_token(
+                    self, self.refresh_token, self.hardware_id
+                )
+                if token_data:
+                    await self._process_token_data(token_data)
+                    self.is_errored = False
+                    AUTH_LOGGER.info(
+                        "OAuth v2 token refresh successful",
+                        extra={
+                            "event": "token_refresh",
+                            "refresh_path": "oauth_v2",
+                            **context,
+                            "expires_in_s": self.expires_in,
+                        },
+                    )
+                    return True
+                AUTH_LOGGER.warning(
+                    "OAuth v2 token refresh returned no data; trying startup fallback",
+                    extra={
+                        "event": "token_refresh_fail",
+                        "refresh_path": "oauth_v2",
+                        "error_type": "EmptyTokenResponse",
+                        **context,
+                    },
+                )
+            else:
+                AUTH_LOGGER.warning(
+                    "Missing refresh_token or hardware_id; trying startup fallback",
+                    extra={
+                        "event": "token_refresh_fail",
+                        "refresh_path": "oauth_v2",
+                        "error_type": "MissingRefreshMaterial",
+                        **context,
+                    },
+                )
+
+            AUTH_LOGGER.info(
+                "Falling back to Auth.startup() for token refresh",
+                extra={
+                    "event": "token_refresh",
+                    "refresh_path": "startup_fallback",
+                    **context,
+                },
+            )
+            try:
+                await self.startup()
+            except BlinkTwoFARequiredError as error:
+                AUTH_LOGGER.error(
+                    "Token refresh requires interactive 2FA",
+                    extra={
+                        "event": "token_refresh_fail",
+                        "refresh_path": "startup_fallback",
+                        "error_type": "BlinkTwoFARequiredError",
+                        **context,
+                    },
+                )
+                raise TokenRefreshFailed from error
+
+            self.is_errored = False
+            AUTH_LOGGER.info(
+                "Token refresh via Auth.startup() successful",
+                extra={
+                    "event": "token_refresh",
+                    "refresh_path": "startup_fallback",
+                    **context,
+                    "expires_in_s": self.expires_in,
+                },
+            )
+            return True
+        except TokenRefreshFailed:
+            raise
+        except BlinkTwoFARequiredError as error:
+            AUTH_LOGGER.error(
+                "Token refresh requires interactive 2FA",
+                extra={
+                    "event": "token_refresh_fail",
+                    "refresh_path": "startup_fallback",
+                    "error_type": "BlinkTwoFARequiredError",
+                    **context,
+                },
+            )
+            raise TokenRefreshFailed from error
+        except Exception as error:
+            AUTH_LOGGER.error(
+                "Token refresh failed: %s",
+                error,
+                extra={
+                    "event": "token_refresh_fail",
+                    "refresh_path": "startup_fallback",
+                    "error_type": type(error).__name__,
+                    **context,
+                },
+            )
+            raise TokenRefreshFailed from error
+
+    Auth.refresh_tokens = refresh_tokens
+
+
 _patch_blinkpy_oauth_signin()
+_patch_blinkpy_refresh_tokens()
 
 
 def env_value(*names: str) -> str | None:
@@ -152,7 +355,7 @@ def parse_args() -> argparse.Namespace:
         "-v",
         "--verbose",
         action="store_true",
-        help="Enable debug logging.",
+        help="Enable debug logging (overrides LOG_LEVEL).",
     )
     args = parser.parse_args()
 
@@ -231,17 +434,67 @@ async def load_login_data(session_path: Path) -> dict:
             if isinstance(saved, dict):
                 login_data.update(saved)
         except Exception as exc:
-            logging.warning("Could not load session file %s: %s", session_path, exc)
+            LOGGER.warning(
+                "Could not load session file %s: %s",
+                session_path,
+                exc,
+                extra={"event": "startup", "error_type": type(exc).__name__},
+            )
     return login_data
 
 
-async def connect_blink(blink: Blink, session_path: Path, http_session: ClientSession) -> None:
+def attach_session_saver(blink: Blink, session_path: Path) -> None:
+    """Persist rotated tokens immediately after blinkpy refreshes mid-request."""
+
+    async def _save() -> None:
+        try:
+            await blink.save(str(session_path))
+            AUTH_LOGGER.info(
+                "Session saved after token refresh",
+                extra={"event": "token_refresh", "path": str(session_path)},
+            )
+        except Exception as exc:
+            AUTH_LOGGER.error(
+                "Failed to save session after token refresh: %s",
+                exc,
+                extra={
+                    "event": "token_refresh_fail",
+                    "error_type": type(exc).__name__,
+                    "path": str(session_path),
+                },
+            )
+
+    def _callback() -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            AUTH_LOGGER.warning(
+                "No running event loop; cannot schedule session save",
+                extra={"event": "token_refresh_fail", "error_type": "RuntimeError"},
+            )
+            return
+        loop.create_task(_save())
+
+    blink.auth.callback = _callback
+
+
+async def connect_blink(
+    blink: Blink,
+    session_path: Path,
+    http_session: ClientSession,
+    *,
+    allow_2fa: bool = True,
+) -> None:
     login_data = await load_login_data(session_path)
     blink.auth = Auth(login_data, no_prompt=True, session=http_session)
 
     try:
         await blink.start()
     except BlinkTwoFARequiredError:
+        if not allow_2fa:
+            raise BlinkConnectError(
+                "Blink requires two-step verification; re-auth interactively on the host."
+            ) from None
         print(
             "Blink requires two-step verification. "
             "Check your email or phone (SMS/WhatsApp) for a code.",
@@ -249,29 +502,26 @@ async def connect_blink(blink: Blink, session_path: Path, http_session: ClientSe
         )
         code = input("Enter verification code: ").strip()
         if not code:
-            print("No verification code provided.", file=sys.stderr)
-            sys.exit(1)
+            raise BlinkConnectError("No verification code provided.") from None
         if not await blink.send_2fa_code(code):
-            print("Verification failed. Try again.", file=sys.stderr)
-            sys.exit(1)
+            raise BlinkConnectError("Verification failed. Try again.") from None
     except (LoginError, TokenRefreshFailed) as exc:
-        print(
-            "Blink login failed. Check BLINK_USERNAME and BLINK_PASSWORD in .env.",
-            file=sys.stderr,
-        )
-        logging.debug("Login error: %s", exc)
-        sys.exit(1)
+        raise BlinkConnectError(
+            "Blink login failed. Check BLINK_USERNAME and BLINK_PASSWORD."
+        ) from exc
 
     if not blink.available:
-        print(
-            "Failed to connect to Blink after login. "
-            "Run with -v for details.",
-            file=sys.stderr,
+        raise BlinkConnectError(
+            "Failed to connect to Blink after login. Run with -v / LOG_LEVEL=DEBUG."
         )
-        sys.exit(1)
 
     await blink.refresh(force_cache=True)
     await blink.save(str(session_path))
+    attach_session_saver(blink, session_path)
+    LOGGER.info(
+        "Connected to Blink",
+        extra={"event": "startup", "path": str(session_path)},
+    )
 
 
 def resolve_camera(blink: Blink, camera_name: str):
@@ -294,11 +544,9 @@ def resolve_camera(blink: Blink, camera_name: str):
         return blink.cameras[partial[0]]
 
     available = ", ".join(sorted(blink.cameras)) or "(none)"
-    print(
-        f"Camera '{camera_name}' not found.\nAvailable cameras: {available}",
-        file=sys.stderr,
+    raise CameraNotFoundError(
+        f"Camera '{camera_name}' not found. Available cameras: {available}"
     )
-    sys.exit(1)
 
 
 def output_path(output_dir: Path, camera_name: str, mode: str) -> Path:
@@ -469,16 +717,52 @@ async def take_snapshot(
     return dest
 
 
+async def reconnect_blink(
+    blink: Blink,
+    camera_name: str,
+    session_path: Path,
+    http_session: ClientSession,
+    *,
+    capture: int,
+):
+    LOGGER.info(
+        "Attempting Blink reconnect",
+        extra={
+            "event": "reconnect",
+            "capture": capture,
+            "camera": camera_name,
+        },
+    )
+    await connect_blink(blink, session_path, http_session, allow_2fa=False)
+    camera = resolve_camera(blink, camera_name)
+    LOGGER.info(
+        "Blink reconnect succeeded",
+        extra={
+            "event": "reconnect",
+            "capture": capture,
+            "camera": camera_name,
+        },
+    )
+    return camera
+
+
 async def watch_loop(
     blink: Blink,
     camera,
     args: argparse.Namespace,
     session_path: Path,
+    http_session: ClientSession,
 ) -> None:
-    print(
-        f"Capturing '{args.camera}' every {args.interval}s "
-        f"(mode: {args.mode}). Press Ctrl+C to stop.",
-        file=sys.stderr,
+    LOGGER.info(
+        "Capturing '%s' every %ss (mode: %s)",
+        args.camera,
+        args.interval,
+        args.mode,
+        extra={
+            "event": "startup",
+            "camera": args.camera,
+            "mode": args.mode,
+        },
     )
 
     capture_count = 0
@@ -490,8 +774,66 @@ async def watch_loop(
                 dest = await take_snapshot(blink, camera, args)
                 report_saved(dest, args.mode)
                 await blink.save(str(session_path))
+                LOGGER.info(
+                    "Capture #%d succeeded",
+                    capture_count,
+                    extra={
+                        "event": "capture_ok",
+                        "capture": capture_count,
+                        "camera": args.camera,
+                        "mode": args.mode,
+                        "path": str(dest),
+                    },
+                )
+            except WATCH_RECOVERABLE_ERRORS as exc:
+                LOGGER.error(
+                    "Capture #%d failed: %s",
+                    capture_count,
+                    exc,
+                    extra={
+                        "event": "capture_fail",
+                        "capture": capture_count,
+                        "camera": args.camera,
+                        "mode": args.mode,
+                        "error_type": type(exc).__name__,
+                    },
+                    exc_info=LOGGER.isEnabledFor(logging.DEBUG),
+                )
+                try:
+                    camera = await reconnect_blink(
+                        blink,
+                        args.camera,
+                        session_path,
+                        http_session,
+                        capture=capture_count,
+                    )
+                except Exception as reconnect_exc:
+                    LOGGER.error(
+                        "Reconnect after capture #%d failed: %s",
+                        capture_count,
+                        reconnect_exc,
+                        extra={
+                            "event": "reconnect_fail",
+                            "capture": capture_count,
+                            "camera": args.camera,
+                            "error_type": type(reconnect_exc).__name__,
+                        },
+                        exc_info=LOGGER.isEnabledFor(logging.DEBUG),
+                    )
             except Exception as exc:
-                logging.error("Capture #%d failed: %s", capture_count, exc)
+                LOGGER.error(
+                    "Capture #%d failed: %s",
+                    capture_count,
+                    exc,
+                    extra={
+                        "event": "capture_fail",
+                        "capture": capture_count,
+                        "camera": args.camera,
+                        "mode": args.mode,
+                        "error_type": type(exc).__name__,
+                    },
+                    exc_info=LOGGER.isEnabledFor(logging.DEBUG),
+                )
 
             elapsed = asyncio.get_running_loop().time() - started
             wait = max(0, args.interval - elapsed)
@@ -500,7 +842,11 @@ async def watch_loop(
     except asyncio.CancelledError:
         raise
     finally:
-        print(f"Stopped after {capture_count} capture(s).", file=sys.stderr)
+        LOGGER.info(
+            "Stopped after %d capture(s)",
+            capture_count,
+            extra={"event": "startup", "capture": capture_count, "camera": args.camera},
+        )
 
 
 async def list_cameras(blink: Blink) -> None:
@@ -517,7 +863,11 @@ async def list_cameras(blink: Blink) -> None:
 async def run(args: argparse.Namespace) -> None:
     async with ClientSession() as session:
         blink = Blink(session=session)
-        await connect_blink(blink, args.session, session)
+        try:
+            await connect_blink(blink, args.session, session, allow_2fa=True)
+        except BlinkConnectError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
 
         if args.list:
             await list_cameras(blink)
@@ -527,10 +877,14 @@ async def run(args: argparse.Namespace) -> None:
             print("error: --camera is required (or use --list).", file=sys.stderr)
             sys.exit(2)
 
-        camera = resolve_camera(blink, args.camera)
+        try:
+            camera = resolve_camera(blink, args.camera)
+        except CameraNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
 
         if args.interval:
-            await watch_loop(blink, camera, args, args.session)
+            await watch_loop(blink, camera, args, args.session, session)
             return
 
         dest = await take_snapshot(blink, camera, args)
@@ -540,10 +894,7 @@ async def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s: %(message)s",
-    )
+    configure_logging(resolve_log_level(args.verbose))
     asyncio.run(run(args))
 
 
