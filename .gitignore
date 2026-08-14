@@ -20,3 +20,8 @@ blink_credentials.json
 venv/
 __pycache__/
 *.pyc
+
+# Git worktrees (local isolation)
+.worktrees/
+
+.pytest_cache/
